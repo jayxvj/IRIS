@@ -1,4 +1,4 @@
-# 🛡️ Sentinel AI (IRIS)
+#                             🛡️ IRIS 🛡️
 ### *Next-Generation Endpoint Protection, Biometric Guardian & Contextual Cryptographic Defense*
 
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-0078D6?logo=windows&logoColor=white)](https://microsoft.com)
