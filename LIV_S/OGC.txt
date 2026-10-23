@@ -1,0 +1,579 @@
+import warnings
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API")
+
+import cv2
+import face_recognition
+import os
+import time
+import hashlib
+import difflib
+import stat
+import winsound
+import threading
+import datetime
+import pygetwindow as gw
+import ctypes
+import tkinter as tk
+from tkinter import filedialog
+import sys
+import msvcrt
+import win32api
+import win32console
+import win32gui
+import win32con
+
+# --- CONFIGURATION ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ADMIN_PHOTO = os.path.join(BASE_DIR, "admin.jpg")
+INTRUDER_FOLDER = os.path.join(BASE_DIR, "intruder_evidence")
+
+# GRACE PERIOD (Seconds) when file is FIRST opened
+INITIAL_GRACE_PERIOD = 5 
+
+ALLOWED_EXTENSIONS = {
+    '.txt', '.md', '.json', '.xml', '.csv', '.log', '.ini', '.cfg', '.conf',
+    '.py', '.java', '.c', '.cpp', '.h', '.hpp', '.cs', '.js', '.jsx', '.ts',
+    '.tsx', '.html', '.css', '.scss', '.php', '.rb', '.go', '.rs', '.swift',
+    '.kt', '.lua', '.pl', '.sh', '.bat', '.ps1', '.sql', '.yaml', '.yml'
+}
+
+if not os.path.exists(INTRUDER_FOLDER):
+    os.makedirs(INTRUDER_FOLDER)
+
+class FinalGuardian:
+
+    def __init__(self, file_paths, admin_image_path):
+        self.raw_paths = file_paths
+        self.file_paths = []
+        self.admin_image_path = admin_image_path
+        self.script_path = os.path.abspath(__file__)
+        self.script_handle = None
+        
+        # Resources
+        self.cap = None
+        self.camera_lock = threading.Lock()
+        
+        # State Tracking
+        self.detection_start_time = None 
+        self.last_face_check_time = 0
+        
+        # FACE BUFFER
+        self.missing_admin_counter = 0 
+
+        # --- DISABLE VISUAL 'X' BUTTON ---
+        self.disable_close_button()
+
+        # --- REGISTER EXIT HANDLER ---
+        win32api.SetConsoleCtrlHandler(self.on_exit_attempt, True)
+
+        # --- PRE-FLIGHT CHECK ---
+        print("🔍 PRE-FLIGHT CHECK: Scanning for open editors...")
+        script_name = os.path.basename(self.script_path)
+        for title in gw.getAllTitles():
+            if script_name in title:
+                if "python" in title.lower() or "cmd" in title.lower() or "guardian" in title.lower():
+                    continue
+                print(f"❌ SECURITY RISK: '{script_name}' is open in '{title}'.")
+                print("   Close the editor first.")
+                os._exit(1)
+
+        # --- SELF LOCK ---
+        try:
+            self.script_handle = open(self.script_path, "r")
+            msvcrt.locking(self.script_handle.fileno(), msvcrt.LK_NBLCK, os.path.getsize(self.script_path))
+        except:
+            pass
+
+        # --- FILTER FILES ---
+        print("\n🔍 VERIFYING FILE TYPES...")
+        if self.script_path not in self.raw_paths:
+            self.raw_paths.append(self.script_path)
+
+        for path in self.raw_paths:
+            ext = os.path.splitext(path)[1].lower()
+            if ext in ALLOWED_EXTENSIONS:
+                self.file_paths.append(path)
+
+        if not self.file_paths:
+            print("\n❌ NO VALID TEXT/CODE FILES SELECTED.")
+            time.sleep(3)
+            os._exit(1)
+
+        # Init Biometrics
+        self.is_authenticated = False
+        self.alarm_triggered = False
+        self.warning_shown = False
+        self.file_database = {}
+
+        print("\n🤖 SYSTEM INIT: Loading Biometrics...")
+        if not os.path.exists(self.admin_image_path):
+            print(f"❌ ERROR: 'admin.jpg' missing.")
+            os._exit(1)
+
+        try:
+            admin_image = face_recognition.load_image_file(self.admin_image_path)
+            encodings = face_recognition.face_encodings(admin_image)
+            if len(encodings) == 0: raise Exception("No face found")
+            self.admin_encoding = encodings[0]
+            print("✅ ADMIN BIOMETRICS LOADED.")
+        except Exception as e:
+            print(f"❌ ERROR: Face Library Failed.")
+            os._exit(1)
+
+        print(f"🛡️  PROTECTING {len(self.file_paths)} FILES.")
+        
+        # Load initial file state
+        for path in self.file_paths:
+            try:
+                stat_info = os.stat(path)
+                self.file_database[path] = {
+                    'mtime': stat_info.st_mtime,
+                    'hash': self.calculate_hash(path),
+                    'content': self.read_file_content(path)
+                }
+            except Exception as e:
+                print(f"⚠️ Error reading {os.path.basename(path)}")
+
+    def get_camera_frame(self):
+        """Automatically opens camera if closed, reads a frame."""
+        with self.camera_lock:
+            if self.cap is None or not self.cap.isOpened():
+                # self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) # Faster on Windows
+                self.cap = cv2.VideoCapture(0)
+                # Warmup needed sometimes
+                if self.cap.isOpened():
+                    for _ in range(5): self.cap.read() 
+            
+            if self.cap.isOpened():
+                return self.cap.read()
+            return False, None
+
+    def release_camera(self):
+        """Closes the camera to save resources."""
+        with self.camera_lock:
+            if self.cap and self.cap.isOpened():
+                self.cap.release()
+            self.cap = None
+
+    def disable_close_button(self):
+        try:
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                hmenu = ctypes.windll.user32.GetSystemMenu(hwnd, False)
+                ctypes.windll.user32.DeleteMenu(hmenu, 0xF060, 0x00000000)
+                ctypes.windll.user32.DrawMenuBar(hwnd)
+        except:
+            pass
+
+    def on_exit_attempt(self, event_type):
+        if event_type in [0, 2]:
+            if self.alarm_triggered:
+                return True
+
+            print("\n\n🛑 STOP/CLOSE ATTEMPT DETECTED! VERIFYING ADMIN...")
+            
+            start = time.time()
+            auth = False
+
+            # Ensure cam is open for exit check
+            ret, frame = self.get_camera_frame()
+
+            while (time.time() - start) < 8:
+                ret, frame = self.get_camera_frame()
+                if ret and self.get_face_match_static(frame):
+                    auth = True
+                    break
+                time.sleep(0.05) 
+
+            if auth:
+                print("✅ ADMIN CONFIRMED. GOODBYE.")
+                winsound.Beep(1000, 200)
+                self.release_camera()
+                os._exit(0)
+            else:
+                print("❌ ACCESS DENIED. RESUMING SURVEILLANCE.")
+                threading.Thread(target=lambda: winsound.Beep(3000, 1000), daemon=True).start()
+                return True
+        return False
+
+    def get_face_match_static(self, frame):
+        try:
+            small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            encs = face_recognition.face_encodings(rgb)
+
+            if not hasattr(self, "_face_hits"):
+                self._face_hits = 0
+
+            if len(encs) == 0:
+                return False
+
+            for enc in encs:
+                match = face_recognition.compare_faces([self.admin_encoding], enc, tolerance=0.45)
+                if match[0]:
+                    self._face_hits += 1
+                else:
+                    self._face_hits = max(0, self._face_hits - 1)
+
+                if self._face_hits >= 1: 
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def get_face_match(self, frame):
+        return self.get_face_match_static(frame)
+
+    def calculate_hash(self, path):
+        sha = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    sha.update(chunk)
+            return sha.hexdigest()
+        except:
+            return None
+
+    def read_file_content(self, path):
+        try:
+            with open(path, "r", encoding='utf-8', errors='ignore') as f:
+                return f.readlines()
+        except:
+            return []
+
+    def are_any_files_open(self):
+        try:
+            windows = gw.getAllTitles()
+            for path in self.file_paths:
+                full = os.path.basename(path).lower()
+                no_ext = os.path.splitext(full)[0]
+                for title in windows:
+                    t = title.lower()
+                    if (full in t or no_ext in t) and not ("guardian" in t or "python" in t):
+                        return True
+            return False
+        except:
+            return False
+
+    def update_file_database(self, path):
+        """Called when Admin is verified after an edit."""
+        try:
+            stat_info = os.stat(path)
+            self.file_database[path] = {
+                'mtime': stat_info.st_mtime,
+                'hash': self.calculate_hash(path),
+                'content': self.read_file_content(path)
+            }
+        except:
+            pass
+
+    def trigger_alarm(self, path):
+        self.alarm_triggered = True
+
+        # Ensure Camera is ON for evidence
+        self.get_camera_frame()
+
+        print(f"\n📸 INTRUDER DETECTED IN {os.path.basename(path)}! CAPTURING EVIDENCE...")
+        evidence_photos = []
+        for i in range(3):
+            ret, frame = self.get_camera_frame()
+            if ret:
+                ts = int(time.time())
+                f_path = os.path.join(INTRUDER_FOLDER, f"intruder_{ts}_{i}.jpg")
+                cv2.imwrite(f_path, frame)
+                evidence_photos.append(f_path)
+            time.sleep(0.3)
+
+        print("🔒 LOCKING FILES...")
+        for p in self.file_paths:
+            try:
+                os.chmod(p, stat.S_IREAD)
+            except:
+                pass
+
+        log_file = os.path.join(INTRUDER_FOLDER, f"incident_{int(time.time())}.txt")
+        try:
+            with open(log_file, "w", encoding="utf-8") as f:
+                f.write(f"🚨 SECURITY REPORT\n")
+                f.write(f"📅 Time: {datetime.datetime.now()}\n")
+                f.write(f"📂 File: {path}\n")
+                f.write("-" * 40 + "\n")
+                
+                new_content = self.read_file_content(path)
+                old_content = self.file_database[path]['content']
+                diff = difflib.unified_diff(old_content, new_content, lineterm='')
+                
+                for line in diff:
+                    f.write(line.rstrip() + "\n")
+        except Exception:
+            pass
+
+        print("🚨 ALARM RINGING! WAITING FOR ADMIN...")
+
+        def play_sound():
+            while self.alarm_triggered:
+                winsound.Beep(2500, 500)
+                time.sleep(0.1)
+
+        sound_thread = threading.Thread(target=play_sound, daemon=True)
+        sound_thread.start()
+
+        # LOOP UNTIL ADMIN FACE SCANNED
+        while True:
+            ret, frame = self.get_camera_frame()
+            if ret and self.get_face_match(frame):
+                print("✅ ADMIN RECOGNIZED. DISARMING SYSTEM.")
+                break
+            time.sleep(0.1)
+
+        self.alarm_triggered = False
+        self.warning_shown = False
+        self.detection_start_time = None 
+        self.is_authenticated = True 
+        self.missing_admin_counter = 0
+
+        # Restore file access and update DB (User verified changes)
+        for p in self.file_paths:
+            try:
+                os.chmod(p, stat.S_IWRITE)
+                self.update_file_database(p)
+            except:
+                pass
+        
+        # Close camera immediately after disarming
+        self.release_camera()
+
+        if os.path.exists(log_file): os.startfile(log_file)
+        for p in evidence_photos:
+            if os.path.exists(p): os.startfile(p)
+
+    def show_warning(self):
+        if self.warning_shown: return
+        self.warning_shown = True
+
+        def msg():
+            ctypes.windll.user32.MessageBoxW(0, "UNAUTHORIZED USER DETECTED.\nDO NOT EDIT.", "WARNING", 0x10 | 0x1000)
+
+        threading.Thread(target=msg, daemon=True).start()
+
+    def start(self):
+        print("👁️ SENTINEL ACTIVE. Do not close this window.")
+        
+        while True:
+            try:
+                if self.are_any_files_open():
+                    
+                    if not self.alarm_triggered:
+                        
+                        # --- 1. CHECK FOR FILE EDITS (MODIFICATION) FIRST ---
+                        modification_detected = False
+                        modified_path = None
+                        
+                        for p in self.file_paths:
+                            try:
+                                current_stat = os.stat(p)
+                                cached_mtime = self.file_database[p].get('mtime', 0)
+                                
+                                if current_stat.st_mtime != cached_mtime:
+                                    h = self.calculate_hash(p)
+                                    if h is not None and h != self.file_database[p]['hash']:
+                                        modification_detected = True
+                                        modified_path = p
+                                        break
+                            except OSError:
+                                pass
+
+                        # --- 2. HANDLE CAMERA LOGIC BASED ON STATE ---
+                        
+                        if modification_detected:
+                            print(f"✏️ EDIT DETECTED in {os.path.basename(modified_path)}. VERIFYING ADMIN...")
+                            
+                            # FORCE CAMERA ON
+                            ret, frame = self.get_camera_frame()
+                            
+                            # Give camera a moment to focus if it was off, 
+                            # grab a few frames to ensure face detection works
+                            valid_frame = False
+                            for _ in range(3):
+                                ret, frame = self.get_camera_frame()
+                                if ret: valid_frame = True
+                            
+                            if valid_frame and self.get_face_match(frame):
+                                print("✅ EDIT AUTHORIZED. UPDATING DATABASE.")
+                                self.update_file_database(modified_path)
+                                # RE-CLOSE CAMERA
+                                self.release_camera()
+                            else:
+                                # INTRUDER OR FAILED CHECK -> ALARM
+                                self.trigger_alarm(modified_path)
+
+                        elif not self.is_authenticated:
+                            # --- INITIAL AUTHENTICATION PHASE ---
+                            if self.detection_start_time is None:
+                                self.detection_start_time = time.time()
+                                print("👀 File open. Scanning Identity...")
+
+                            ret, frame = self.get_camera_frame()
+                            
+                            if ret:
+                                if self.get_face_match(frame):
+                                    print("✅ AUTHENTICATED. CLOSING CAMERA.")
+                                    self.is_authenticated = True
+                                    self.missing_admin_counter = 0
+                                    self.warning_shown = False
+                                    # CLOSE CAMERA IF AUTHENTICATED
+                                    self.release_camera()
+                                else:
+                                    # Face seen but not admin
+                                    self.missing_admin_counter += 1
+                                    if self.missing_admin_counter > 2:
+                                        elapsed_time = time.time() - self.detection_start_time
+                                        if elapsed_time > INITIAL_GRACE_PERIOD and not self.warning_shown:
+                                            print("⚠️ UNKNOWN USER. DO NOT EDIT.")
+                                            self.show_warning()
+                        
+                        else:
+                            # --- ALREADY AUTHENTICATED & NO CHANGES ---
+                            # Ensure camera is CLOSED to satisfy requirement
+                            self.release_camera()
+
+                else:
+                    # Files closed - Reset all states
+                    self.is_authenticated = False
+                    self.warning_shown = False
+                    self.detection_start_time = None
+                    self.missing_admin_counter = 0
+                    self.release_camera()
+
+                time.sleep(1)
+
+            except Exception as e:
+                print(f"Error loop: {e}")
+                time.sleep(1)
+
+if __name__ == "__main__":
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        ext_string = ";" + ";".join([f"*{x}" for x in ALLOWED_EXTENSIONS])
+        files = filedialog.askopenfilenames(title="Select Text/Code Files", filetypes=[("Text & Code Files", ext_string), ("All Files", "*.*")])
+        root.destroy()
+
+        if files:
+            bot = FinalGuardian(list(files), ADMIN_PHOTO)
+            bot.start()
+        else:
+            print("No files selected.")
+            time.sleep(2)
+
+    except KeyboardInterrupt:
+        os._exit(0)
+    except Exception as e:
+        print(f"Crash: {e}")
+        time.sleep(5)
+        os._exit(1)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@echo off
+:: FORCE LEGACY CONSOLE (Fixes Visual 'X' Removal)
+if not "%1"=="am_legacy" (
+    start conhost.exe cmd /c "%~f0" am_legacy
+    exit
+)
+TITLE UNCLOSABLE SECURITY
+COLOR 0C
+cls
+echo.
+echo    [ GOD MODE ACTIVE ]
+echo    The 'X' button has been disabled.
+echo    To exit, press Ctrl+C and scan your face.
+echo.
+
+python "%~dp0godmod.py"
+
+exit
